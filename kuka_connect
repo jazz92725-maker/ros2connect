@@ -85,7 +85,7 @@ def send_to_kuka(x, y=None, z=None, a=None, b=None, c=None, e1=None):
 def main():
     # 當前手臂的位置 (TCP Base)，做座標轉換時需要用到
     # 請確認這與你實際執行預測時手臂的實際數值一致
-    CURRENT_POSE = [455.32, 63.22, 541.52, 170.78, -9.62, -172.03]
+    CURRENT_POSE = [409.09, -5.5, 629.6, -3.1, 0.0004, -3.1]
     
     if connect_to_kuka(ROBOT_IP, ROBOT_PORT):
         print("\n---  開始執行 ---")
