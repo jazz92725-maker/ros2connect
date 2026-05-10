@@ -1,0 +1,145 @@
+import socket
+import time
+import json
+import zmq
+import numpy as np
+from scipy.spatial.transform import Rotation as R
+
+# --- 全域變數 ---
+kuka_socket = None
+
+# --- 設定通訊 ---
+ROBOT_IP = "172.31.1.147"
+ROBOT_PORT = 30001
+ZMQ_SERVER_IP = "127.0.0.1"
+
+# ==========================================================
+# 🌟 請在此處填入你校正得到的 4x4 手眼校正矩陣 (TCP to Camera)
+# ==========================================================
+HAND_EYE_MATRIX = np.array([
+    [3.30186682e-02, 9.97339194e-01, -6.49946111e-02, -94.6449003],  
+    [-9.99453240e-01, 3.30612103e-02, -4.21174066e-04, 30.85759262],   
+    [1.72874710e-03, 6.49729813e-02, 9.97885526e-01, -111.34259296], 
+    [0.0, 0.0, 0.0, 1.0]
+])
+
+def create_transform_matrix(x, y, z, a, b, c):
+    """ 將 KUKA 格式 (X,Y,Z,A,B,C) 轉換為 4x4 矩陣 """
+    T = np.eye(4)
+    T[0:3, 3] = [x, y, z]
+    # KUKA 旋轉順序 A(Z), B(Y), C(X)
+    r = R.from_euler('ZYX', [a, b, c], degrees=True)
+    T[0:3, 0:3] = r.as_matrix()
+    return T
+
+def get_pose_from_ros():
+    """ 從 ROS 2 節點 (ZMQ Server) 取得目標物體在相機座標系下的座標 """
+    print(" 正在向 ROS 2 節點請求最新姿態...")
+    context = zmq.Context()
+    socket = context.socket(zmq.REQ)
+    socket.connect(f"tcp://{ZMQ_SERVER_IP}:5555")
+    socket.setsockopt(zmq.RCVTIMEO, 3000) 
+    try:
+        socket.send_string("GET_POSE")
+        response_str = socket.recv_string()
+        data = json.loads(response_str)
+        if "error" in data: return None
+        # 回傳完整姿態 [x, y, z, roll, pitch, yaw]
+        return [data['x'], data['y'], data['z'], data['roll'], data['pitch'], data['yaw']]
+    except Exception as e:
+        print(f" 獲取姿態失敗: {e}")
+        return None
+    finally:
+        socket.close()
+        context.term()
+
+def connect_to_kuka(ip, port):
+    global kuka_socket
+    try:
+        kuka_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        kuka_socket.settimeout(60)
+        kuka_socket.connect((ip, port))
+        print(f" 成功連線到 KUKA")
+        return True
+    except Exception as e:
+        print(f" 連線失敗: {e}")
+        return False
+
+def send_to_kuka(x, y=None, z=None, a=None, b=None, c=None, e1=None):
+    global kuka_socket
+    if kuka_socket is None: return False
+    try:
+        if isinstance(x, str):
+            msg = x.strip() + "\n"
+        else:
+            val_b = b if b is not None else 0.0
+            val_c = c if c is not None else 0.0
+            val_e1 = e1 if e1 is not None else 0.0
+            msg = f"{x:.2f},{y:.2f},{z:.2f},{a:.2f},{val_b:.2f},{val_c:.2f},{val_e1:.2f}\n"
+        kuka_socket.send(msg.encode("utf-8"))
+        response = kuka_socket.recv(1024).decode("utf-8").strip()
+        return response == "READY"
+    except:
+        return False
+
+def main():
+    # 當前手臂的位置 (TCP Base)，做座標轉換時需要用到
+    # 請確認這與你實際執行預測時手臂的實際數值一致
+    CURRENT_POSE = [455.32, 63.22, 541.52, 170.78, -9.62, -172.03]
+    
+    if connect_to_kuka(ROBOT_IP, ROBOT_PORT):
+        print("\n---  開始執行 ---")
+        
+        # 1. 移動到預設點 (如果需要的話)
+        print(" 移動至預備點 (P1)...")
+        if send_to_kuka("GOTO_P1"):
+            time.sleep(4)
+            
+            # 2. 取得 AI 辨識出的物體姿態 (相機座標系)
+            obj_in_cam = get_pose_from_ros()
+            
+            if obj_in_cam:
+                # 3. 執行座標轉換 (矩陣相乘)
+                # T_base_obj = T_base_tcp * T_hand_eye * T_cam_obj
+                T_base_tcp = create_transform_matrix(*CURRENT_POSE)
+                T_cam_obj = create_transform_matrix(*obj_in_cam)
+                
+                T_base_obj = T_base_tcp @ HAND_EYE_MATRIX @ T_cam_obj
+                
+                # 提取轉換後的基座座標 XYZ
+                real_x = T_base_obj[0, 3]
+                real_y = T_base_obj[1, 3]
+                real_z = T_base_obj[2, 3]
+                
+                print(f"  轉換後物體在基座座標系: X:{real_x:.2f}, Y:{real_y:.2f}, Z:{real_z:.2f}")
+                
+                # 4. 設定移動目標 (物體上方 10cm + 固定垂直姿態)
+                target_x = real_x
+                target_y = real_y
+                target_z = real_z + 200.0  # 往上 10 公分
+                
+                # 固定垂直朝下的 A, B, C (請依實機調整)
+                target_a = 170.0
+                target_b = 0.0
+                target_c = 180.0
+                target_e1 = -28.65
+                
+                print(f"  準備移動至目標點: X:{target_x:.2f}, Y:{target_y:.2f}, Z:{target_z:.2f}")
+                
+                # 5. 執行移動指令
+                if send_to_kuka(target_x, target_y, target_z, target_a, target_b, target_c, target_e1):
+                    print(" 成功抵達目標位置！")
+                    time.sleep(5)
+                else:
+                    print("  移動指令執行失敗")
+            else:
+                print(" 無法取得有效的辨識數據")
+
+            # 任務結束，退回 Home
+            send_to_kuka("GOTO_P1")
+            
+        if kuka_socket: kuka_socket.close()
+        print("\n=== 任務完成 ===")
+
+if __name__ == "__main__":
+    main()
