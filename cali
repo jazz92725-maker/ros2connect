@@ -1,0 +1,204 @@
+import cv2
+import numpy as np
+import glob
+import math
+import os
+import re
+
+# ==========================================
+# 1. 設定與準備 (Setup)
+# ==========================================
+
+# 棋盤格設定
+BOARD_SIZE = (8, 5)   # 內部角點數量
+SQUARE_SIZE = 30.0    # 每個方格邊長 (mm)
+
+# 相機內參 (D435i 640x480 Crop Mode)
+camera_matrix = np.array([[929.74443, 0.00000, 650.13931],
+    [0.00000, 929.95177, 365.61712],
+    [0.00000, 0.00000, 1.00000]], dtype=np.float32)
+dist_coeffs = np.array([[0.02741, 1.35510, -0.00311, 0.00147, -5.89484]], dtype=np.float32) # 修正為正確形狀
+
+# 準備棋盤格 3D 座標
+objp = np.zeros((BOARD_SIZE[0] * BOARD_SIZE[1], 3), np.float32)
+objp[:, :2] = np.mgrid[0:BOARD_SIZE[0], 0:BOARD_SIZE[1]].T.reshape(-1, 2)
+objp = objp * SQUARE_SIZE
+
+# ==========================================
+# 2. 數據定義 (Data Definition) - 先定義變數！
+# ==========================================
+
+# KUKA 機械手臂數據 [X, Y, Z, A, B, C]
+# 單位: mm, degree
+robot_poses = [
+            [455.32, 63.22, 541.52, 170.78, -9.62, -172.03],
+            [428.03, 173.62, 564.97, 167.0, -4.48, -166.11],
+            [459.36, 71.98, 559.99, -157.37, -12.47, -166.02], # Check Col 3 (59.99)
+            [459.67, 117.56, 553.84, 156.64, -3.18, -167.16],
+            [342.71, -1.79, 673.8, 168.41, 5.29, 178.12],
+            [412.84, 32.46, 596.43, -152.80, 5.47, -164.99],
+            [413.61, 33.32, 499.01, 171.06, 1.16, 179.01],
+            [425.19, 4.4, 525.17, -133.63, -1.87, -173.41],
+            [436.63, 66.96, 469.52, 176.25, -7.53, -174.66],
+            [404.65, -24.09, 580.48, 163.29, -0.85, 170.50],
+            [379.88, 42.95, 586.51, 101.07, -15.28, 175.37]  # 10
+]
+
+# 讀取圖片並強制排序
+images = glob.glob('captured_images/*.png')
+images.sort() # 因為檔名是 01, 02... 用標準排序即可
+
+print(f"\n=== 🔍 配對檢查 (共 {len(images)} 張圖 / {len(robot_poses)} 筆數據) ===")
+if len(images) != len(robot_poses):
+    print(f"❌ 錯誤：圖片數量 ({len(images)}) 與數據數量 ({len(robot_poses)}) 不符！")
+    exit()
+
+# 印出前 3 組供檢查
+for i in range(min(3, len(images))):
+    print(f"Index {i:02d}: {os.path.basename(images[i])} <---> Robot Z: {robot_poses[i][2]}")
+print("============================================\n")
+
+# ==========================================
+# 3. KUKA 旋轉矩陣轉換函式
+# ==========================================
+def kuka_to_rotation_matrix(A, B, C, unit='deg'):
+    """ KUKA 標準定義: Intrinsic Z-Y-X (-A, -B, -C) """
+    if unit == 'deg':
+        A, B, C = map(math.radians, [A, B, C])
+
+    # 繞 X 軸旋轉 (C)
+    Rx = np.array([[1, 0, 0],
+                   [0, math.cos(C), -math.sin(C)],
+                   [0, math.sin(C), math.cos(C)]])
+    # 繞 Y 軸旋轉 (B)
+    Ry = np.array([[math.cos(B), 0, math.sin(B)],
+                   [0, 1, 0],
+                   [-math.sin(B), 0, math.cos(B)]])
+    # 繞 Z 軸旋轉 (A)
+    Rz = np.array([[math.cos(A), -math.sin(A), 0],
+                   [math.sin(A), math.cos(A), 0],
+                   [0, 0, 1]])
+
+    # KUKA 順序: R = Rz(A) * Ry(B) * Rx(C)
+    return Rz @ Ry @ Rx
+
+# ==========================================
+# 4. 主處理迴圈 (Processing Loop)
+# ==========================================
+R_gripper2base = []
+t_gripper2base = []
+R_target2cam = []
+t_target2cam = []
+valid_pairs = 0
+
+print("開始處理圖片與計算姿態...")
+
+for i, fname in enumerate(images):
+    img = cv2.imread(fname)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # 尋找棋盤格
+    ret, corners = cv2.findChessboardCorners(gray, BOARD_SIZE, None)
+
+    if ret:
+        # 優化角點精度
+        corners2 = cv2.cornerSubPix(gray, corners, (5, 5), (-1, -1), 
+                                    (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001))
+        
+        # A. 計算相機姿態 (solvePnP)
+        _, rvec, tvec = cv2.solvePnP(objp, corners2, camera_matrix, dist_coeffs)
+        if np.linalg.norm(tvec) < 1.0: 
+            # 偵測到單位可能是米 (Meters)，轉為 mm
+            tvec = tvec * 1000.0
+        R_cam, _ = cv2.Rodrigues(rvec)
+        
+        R_target2cam.append(R_cam)
+        t_target2cam.append(tvec)
+
+        # B. 處理機械手臂數據 (KUKA)
+        p = robot_poses[i]
+        t_robot = np.array([[p[0]], [p[1]], [p[2]]])
+        
+        # 使用 KUKA 專用函式處理旋轉
+        R_robot = kuka_to_rotation_matrix(p[3], p[4], p[5], unit='deg')
+        
+        R_gripper2base.append(R_robot)
+        t_gripper2base.append(t_robot)
+        
+        valid_pairs += 1
+    else:
+        print(f"⚠️ 警告: 無法在 {fname} 找到棋盤格，此組數據將被忽略。")
+
+# ==========================================
+# 6. 執行手眼校正 (Calibration)
+# ==========================================
+if valid_pairs < 3:
+    print("有效數據不足 (<3)，無法校正。")
+    exit()
+
+
+
+print(f"\n正在使用 {valid_pairs} 組數據進行 Tsai 校正...")
+R_cam2gripper, t_cam2gripper = cv2.calibrateHandEye(
+    R_gripper2base, t_gripper2base, 
+    R_target2cam, t_target2cam, 
+    method=cv2.CALIB_HAND_EYE_TSAI
+)
+
+print("\n--- Calibration Result (Eye-in-Hand) ---")
+print("Rotation Matrix:\n", R_cam2gripper)
+print("Translation Vector:\n", t_cam2gripper)
+
+# ==========================================
+# 7. 自動驗證 (Final Verification)
+# ==========================================
+print("\n--- Running Verification (Reprojection Error) ---")
+
+def create_homogeneous_matrix(R, t):
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3, 3] = t.flatten()
+    return T
+
+T_cam2gripper = create_homogeneous_matrix(R_cam2gripper, t_cam2gripper)
+board_positions_in_base = []
+
+for i in range(len(R_gripper2base)):
+    T_gripper2base = create_homogeneous_matrix(R_gripper2base[i], t_gripper2base[i])
+    T_target2cam_val = create_homogeneous_matrix(R_target2cam[i], t_target2cam[i])
+    
+    # 驗證公式: Base -> Gripper -> Camera -> Target
+    T_base2target = T_gripper2base @ T_cam2gripper @ T_target2cam_val
+    board_positions_in_base.append(T_base2target[:3, 3])
+
+board_positions_in_base = np.array(board_positions_in_base)
+std_dev = np.std(board_positions_in_base, axis=0)
+euclidean_error = np.linalg.norm(std_dev)
+
+print(f"總體歐式距離誤差 (Total Error): {euclidean_error:.4f} mm")
+
+print("\n=== Robot Rotation Sanity Check ===")
+
+R_list = []
+for p in robot_poses:
+    R = kuka_to_rotation_matrix(p[3], p[4], p[5]) 
+    R_list.append(R)
+
+for i in range(1, len(R_list)):
+    dR = R_list[i] @ R_list[0].T
+    angle = np.arccos(
+        np.clip((np.trace(dR) - 1) / 2, -1.0, 1.0)
+    )
+    print(f"Pose {i}: Δrotation = {np.degrees(angle):.2f} deg")
+
+
+if euclidean_error < 5.0:
+    print("✅ 校正成功！(誤差 < 5mm)")
+    # 儲存結果
+    cv_file = cv2.FileStorage('hand_eye_result.yaml', cv2.FILE_STORAGE_WRITE)
+    cv_file.write('R_cam2gripper', R_cam2gripper)
+    cv_file.write('t_cam2gripper', t_cam2gripper)
+    cv_file.release()
+    print("結果已儲存至 hand_eye_result.yaml")
+else:
+    print("❌ 校正誤差過大，請檢查 KUKA 旋轉矩陣順序或數據品質。")
