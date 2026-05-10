@@ -66,7 +66,7 @@ class PoseServerNode(Node):
                 }
             
             # 印出 Log 供除錯
-            self.get_logger().debug(f"更新姿態: X:{tx:.1f}, Y:{ty:.1f}, Z:{tz:.1f}")
+            self.get_logger().info(f"更新姿態: X:{tx:.1f}, Y:{ty:.1f}, Z:{tz:.1f}")
             
         except ValueError:
             pass
